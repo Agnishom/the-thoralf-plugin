@@ -6,6 +6,9 @@
 
 module ThoralfPlugin.Convert where
 
+import System.IO.Unsafe
+import Debug.Trace
+
 import Data.Maybe ( mapMaybe, catMaybes )
 import qualified Data.List as L
 import qualified Data.Map as M
@@ -112,7 +115,6 @@ conv cts = do
     let convertedPair = (sexpr t1', sexpr t2')
     return (convertedPair, deps1 <> deps2)
 
-
   mkEqExpr :: (SExpr, SExpr) -> SExpr
   mkEqExpr (s1,s2) = SMT.eq s1 s2
 
@@ -125,7 +127,7 @@ conv cts = do
     let maybeVals = map (`runReaderT` state) xs
     return $ catMaybes maybeVals
 
-
+showOut x = renderWithStyle unsafeGlobalDynFlags (ppr x) (defaultUserStyle unsafeGlobalDynFlags)
 
 
 -- ** Extraction
@@ -321,7 +323,8 @@ tryConvTheory ty = do
       let kdVars = foldMap snd recurKds ++ decKds
       let deps = addDepParts tyDeps kdVars decls
       return (converted, deps)
-    Nothing -> defaultConvTy ty
+    Nothing -> do
+      defaultConvTy ty
 
 addDepParts :: ConvDependencies -> [KdVar] -> [Decl] -> ConvDependencies
 addDepParts (ConvDeps t k d decl fams) ks decls =
@@ -349,7 +352,7 @@ defaultConvTy ty = do
   defConvTy ty
 
 defConvTy :: Type -> ConvMonad ConvertedType
-defConvTy = tryFnsM [defTyVar, defFn, defTyConApp] where
+defConvTy = tryFnsM [defTyVar, defFn, defTyConApp, defTyApp] where
 
   defTyVar :: Type -> ConvMonad ConvertedType
   defTyVar ty = do
@@ -368,6 +371,13 @@ defConvTy = tryFnsM [defTyVar, defFn, defTyConApp] where
   fnDef strIn strOut =
     "(apply (apply (lit \"->\") " ++
       strIn ++ ") " ++ strOut ++ ")"
+
+  defTyApp :: Type -> ConvMonad ConvertedType
+  defTyApp ty = do
+    (f,x) <- lift $ splitAppTy_maybe ty
+    (f',xs) <- convertType f
+    (x',ys) <- convertType x
+    return (appDef f' x',xs<>ys)
 
   defTyConApp :: Type -> ConvMonad ConvertedType
   defTyConApp ty = do
