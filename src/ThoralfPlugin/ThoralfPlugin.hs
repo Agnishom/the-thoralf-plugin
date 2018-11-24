@@ -112,12 +112,6 @@ mkThoralfInit debug seed = do
     grabSMTsolver :: SMT.Logger -> IO SMT.Solver
     grabSMTsolver logger = SMT.newSolver "z3" solverOpts (Just logger)
 
-    typeDataType = SMT.Atom typeData
-    typeData =
-        -- As one long line to avoid problems with CPP and string gaps.
-        "(declare-datatypes () ((Type (apply (fst Type) (snd Type)) (lit (getstr String)))))"
-
-
 
 thoralfStop :: ThoralfState -> TcPluginM ()
 thoralfStop (ThoralfState {smtSolver = solverRef}) = do
@@ -149,7 +143,7 @@ thoralfSolver debug (ThoralfState smtRef encode deCls) gs' ws' ds' = do
   let convertor = convert (EncodingData deCls encode)
 
   case (convertor gs, convertor $ ws ++ ds) of
-    (Just (ConvCts gExprs decs1), Just (ConvCts wExprs decs2)) -> do
+    (Just (ConvCts gExprs decs1 sorts1), Just (ConvCts wExprs decs2 sorts2)) -> do
       debugIO debug $ "\nDecs:" ++ showList (decs1 ++ decs2)
       debugIO debug $ "\nGivens :" ++ showList gExprs
       debugIO debug $ "\nWanteds :" ++ showList wExprs
@@ -159,6 +153,7 @@ thoralfSolver debug (ThoralfState smtRef encode deCls) gs' ws' ds' = do
       let wCtsWithEv = mapMaybe (addEvTerm . snd) wExprs
       givenCheck <- tcPluginIO $ hideError $ do
         SMT.push smt
+        _ <- SMT.ackCommand smt (defineType $ sorts1 ++ sorts2)
         _ <- traverse (SMT.ackCommand smt) decs1
         _ <- traverse (SMT.assert smt . fst) gExprs
         SMT.check smt
@@ -191,17 +186,10 @@ refresh encoding solverRef debug = do
     let logLevel = if debug then 0 else 1
     logger <- SMT.newLogger logLevel
     z3Solver <- grabSMTsolver logger
-    SMT.ackCommand z3Solver typeDataType
     _ <- traverse (SMT.ackCommand z3Solver) $ map SMT.Atom decs
     SMT.push z3Solver
     return z3Solver
   unsafeTcPluginTcM $ writeMutVar solverRef z3Solver where
-
-  typeDataType = SMT.Atom typeData
-
-  typeData =
-      -- As one long line to avoid problems with CPP and string gaps.
-      "(declare-datatypes () ((Type (apply (fst Type) (snd Type)) (lit (getstr String)))))"
 
   grabSMTsolver :: SMT.Logger -> IO SMT.Solver
   grabSMTsolver logger = SMT.newSolver "z3" solverOpts (Just logger)

@@ -62,6 +62,7 @@ data ConvCts where
   ConvCts ::
     { convEquals :: [(SExpr, Ct)]
     , convDeps :: [SExpr]
+    , convSorts :: [String]
     } -> ConvCts
 
 
@@ -103,7 +104,7 @@ conv cts = do
   let matchingCts = map snd $ disEquals ++ equals
   --guard (length matchingCts == length (disEqExprs ++ eqExprs))
   let convPairs = zip (disEqExprs ++ eqExprs) matchingCts
-  return $ ConvCts convPairs decls
+  return $ ConvCts convPairs decls (convNewSorts deps)
 
   where
 
@@ -167,10 +168,11 @@ maybeExtractTyEq ct = do
 -- ** Converting the Dependencies
 ----------------------------------------
 
+nub :: Ord a => [a] -> [a]
+nub = S.toList . S.fromList
 
 convertDeps :: ConvDependencies -> ConvMonad [SExpr]
-convertDeps (ConvDeps tyvars' kdvars' defvars' decs fams') = do
-  let nub = S.toList . S.fromList
+convertDeps (ConvDeps tyvars' kdvars' defvars' decs fams' _) = do
   let tyvars = nub tyvars'
   let kdvars = nub kdvars'
   let defvars = nub defvars'
@@ -192,6 +194,14 @@ convertDeps (ConvDeps tyvars' kdvars' defvars' decs fams') = do
   let otherExprs = decExprs ++ tvPreds
   let exprs = varExprs ++ otherExprs
   return exprs
+
+defineType :: [String] -> SExpr
+defineType sorts' = SMT.Atom $
+    "(declare-datatypes () ((Type (apply (fst Type) (snd Type)) (constructor (getCon String)) "++unwords xs++")))"
+  where
+  sorts = nub sorts'
+  xs = map f sorts
+  f s = unwords ["(inc"++s,"(get"++s,s++"))"]
 
 convertFam :: TyCon -> ConvMonad (SExpr,[KdVar])
 convertFam fam = do
@@ -260,6 +270,7 @@ data ConvDependencies where
     , convDefVar :: [TyVar] -- Type variables for default, syntactic theories
     , convDecs   :: [Decl]  -- SMT declarations specific to some converted type
     , convTyFams :: [TyCon]
+    , convNewSorts :: [String]
     } -> ConvDependencies
 
 noDeps :: ConvDependencies
@@ -273,13 +284,12 @@ data Decl where
 
 type Hash = String
 
-
 instance Semigroup ConvDependencies where
-  (ConvDeps a b c d i) <> (ConvDeps e f g h j) =
-    ConvDeps (a ++ e) (b ++ f) (c ++ g) (d ++ h) (i ++ j)
+  (ConvDeps a b c d i k) <> (ConvDeps e f g h j l) =
+    ConvDeps (a ++ e) (b ++ f) (c ++ g) (d ++ h) (i ++ j) (k ++ l)
 
 instance Monoid ConvDependencies where
-  mempty = ConvDeps [] [] [] [] []
+  mempty = ConvDeps [] [] [] [] [] []
   mappend = (<>)
 
 
@@ -290,15 +300,27 @@ instance Monoid ConvDependencies where
 
 
 convertType :: Type -> ConvMonad ConvertedType
-convertType ty =
+convertType ty = do
   case tyVarConv ty of
     Just (smtVar, tyvar) ->
       return  (smtVar, noDeps {convTyVars = [tyvar]})
     Nothing -> tryConvTheory ty
 
+-- Converts types of arbitary SMT Sort to types of SMT Sort Type
+convertTypeToSortType :: Type -> ConvMonad ConvertedType
+convertTypeToSortType ty = do
+  (t, deps) <- convertType ty
+  (k, kdvars) <- convertKind $ typeKind ty
+  if k == "Type"
+  then return (t,deps)
+  else do
+    let t' = "(inc"++k++" "++t++")"
+    return $ (t', deps{convKdVars = kdvars ++ convKdVars deps
+                      ,convNewSorts = k:convNewSorts deps})
+
 tyVarConv :: Type -> Maybe (String, TyVar)
 tyVarConv ty = do
-  tyvar <- tcGetTyVar_maybe ty
+  tyvar <- getTyVar_maybe ty
   -- Not checking for skolems.
   -- See doc on "dumb tau variables"
   let isSkolem = True
@@ -327,8 +349,8 @@ tryConvTheory ty = do
       defaultConvTy ty
 
 addDepParts :: ConvDependencies -> [KdVar] -> [Decl] -> ConvDependencies
-addDepParts (ConvDeps t k d decl fams) ks decls =
-  ConvDeps t (k ++ ks) d (decl ++ decls) fams
+addDepParts (ConvDeps t k d decl fams s) ks decls =
+  ConvDeps t (k ++ ks) d (decl ++ decls) fams s
 
 convDecConts :: [DecCont] -> ConvMonad ([Decl], [KdVar])
 convDecConts dcs = do
@@ -348,50 +370,45 @@ convDecConts dcs = do
 
 
 defaultConvTy :: Type -> ConvMonad ConvertedType
-defaultConvTy ty = do
-  defConvTy ty
-
-defConvTy :: Type -> ConvMonad ConvertedType
-defConvTy = tryFnsM [defTyVar, defFn, defTyConApp, defTyApp] where
-
-  defTyVar :: Type -> ConvMonad ConvertedType
-  defTyVar ty = do
-    tv <- lift $ getTyVar_maybe ty
-    return ( show $ getUnique tv, noDeps {convDefVar = [tv]})
-
+defaultConvTy = tryFnsM [defFn, defTyConApp, defTyApp] where
   defFn :: Type -> ConvMonad ConvertedType
   defFn ty = do
     (fn, arg) <- lift $ splitFunTy_maybe ty
-    (fnStr, tv1) <- defConvTy fn
-    (argStr, tv2) <- defConvTy arg
+    (fnStr, tv1) <- convertType fn
+    (argStr, tv2) <- convertType arg
     let smtStr = fnDef fnStr argStr
     return (smtStr, tv1 <> tv2)
 
   fnDef :: String -> String -> String
   fnDef strIn strOut =
-    "(apply (apply (lit \"->\") " ++
+    "(apply (apply (constructor \"->\") " ++
       strIn ++ ") " ++ strOut ++ ")"
 
   defTyApp :: Type -> ConvMonad ConvertedType
   defTyApp ty = do
     (f,x) <- lift $ splitAppTy_maybe ty
-    (f',xs) <- convertType f
-    (x',ys) <- convertType x
+    (f',xs) <- convertTypeToSortType f
+    (x',ys) <- convertTypeToSortType x
     return (appDef f' x',xs<>ys)
 
   defTyConApp :: Type -> ConvMonad ConvertedType
   defTyConApp ty = do
     (tcon, tys) <- lift $ splitTyConApp_maybe ty
-    recur <- traverse convertType tys
-    let defConvTys = map fst recur
-    let tvars = foldMap snd recur
     if isTypeFamilyTyCon tcon
     then do
-      let convTcon = (show $ getUnique tcon)
+      -- Type families are represented as smt functions
+      recur <- traverse convertType tys
+      let defConvTys = map fst recur
+      let tvars = foldMap snd recur
+      let convTcon = show (getUnique tcon)
       let converted = "("++unwords (convTcon:defConvTys)++")"
       return (converted, tvars{convTyFams = tcon : convTyFams tvars})
     else do
-      let convTcon = "(lit \"" ++ (show $ getUnique tcon) ++ "\")"
+      -- Type constructors are represented as (constructor ...)
+      recur <- traverse convertTypeToSortType tys
+      let defConvTys = map fst recur
+      let tvars = foldMap snd recur
+      let convTcon = "(constructor \"" ++ (show $ getUnique tcon) ++ "\")"
       let converted = foldl appDef convTcon defConvTys
       return (converted, tvars)
 
