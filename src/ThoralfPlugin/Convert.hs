@@ -6,7 +6,6 @@
 
 module ThoralfPlugin.Convert where
 
-import System.IO.Unsafe
 import Debug.Trace
 
 import Data.Maybe ( mapMaybe, catMaybes )
@@ -25,12 +24,12 @@ import Outputable hiding ( (<>) )
 import GhcPlugins hiding ( (<>) )
 import TcRnTypes ( Ct, ctPred )
 import Class ( Class(..) )
-import TcType ( Kind, tcGetTyVar_maybe )
+import TcType ( Kind )
 import Var ( TyVar )
 import Type ( Type, PredTree (..), EqRel (..), getTyVar_maybe
             , splitTyConApp_maybe, splitFunTy_maybe
             , classifyPredType, tyVarKind )
-
+import CoAxiom
 
 -- Internal imports
 import ThoralfPlugin.Encode.TheoryEncoding
@@ -172,10 +171,9 @@ nub :: Ord a => [a] -> [a]
 nub = S.toList . S.fromList
 
 convertDeps :: ConvDependencies -> ConvMonad [SExpr]
-convertDeps (ConvDeps tyvars' kdvars' defvars' decs fams' _) = do
+convertDeps (ConvDeps tyvars' kdvars' decs fams' _) = do
   let tyvars = nub tyvars'
   let kdvars = nub kdvars'
-  let defvars = nub defvars'
   let fams = L.nub fams'
   (EncodingData _ theories) <- ask
   let mkPred = tyVarPreds theories
@@ -184,13 +182,14 @@ convertDeps (ConvDeps tyvars' kdvars' defvars' decs fams' _) = do
   convertedTyVars <- traverse convertTyVars tyvars
   convertedFams <- traverse convertFam fams
   let tyVarExprs = map fst convertedTyVars
-  let famExprs = map fst convertedFams
-  let kindVars = nub $ concatMap snd convertedTyVars ++ kdvars ++ concatMap snd convertedFams
+  let famDecs       = map       (\(a,_,_)->a) convertedFams
+  let famAssertions = concatMap (\(_,b,_)->b) convertedFams
+  let famKdVars     = concatMap (\(_,_,c)->c) convertedFams
+  let kindVars = nub $ concatMap snd convertedTyVars ++ kdvars ++ famKdVars
   let kindExprs = map mkSMTSort kindVars
-  let defExprs = map mkDefaultSMTVar defvars
   decExprs <- convertDecs decs
   -- Order matters:
-  let varExprs = kindExprs ++ tyVarExprs ++ defExprs ++ famExprs
+  let varExprs = kindExprs ++ tyVarExprs ++ famDecs ++ famAssertions
   let otherExprs = decExprs ++ tvPreds
   let exprs = varExprs ++ otherExprs
   return exprs
@@ -203,7 +202,7 @@ defineType sorts' = SMT.Atom $
   xs = map f sorts
   f s = unwords ["(inc"++s,"(get"++s,s++"))"]
 
-convertFam :: TyCon -> ConvMonad (SExpr,[KdVar])
+convertFam :: TyCon -> ConvMonad (SExpr,[SExpr],[KdVar])
 convertFam fam = do
   let name = show $ getUnique fam
   let kind = tyConKind fam
@@ -211,8 +210,18 @@ convertFam fam = do
   argDeps <- mapM convertKind argtys
   (res,resDeps) <- convertKind resty
   let args = unwords $ map fst argDeps
-  let smtStr = unwords ["(declare-fun",name,"(" ++ args ++ ")",res,")"]
-  return (SMT.Atom smtStr, foldMap snd argDeps ++ resDeps)
+  let smtStr = SMT.Atom $ unwords ["(declare-fun",name,"(" ++ args ++ ")",res,")"]
+  assertions <- convertFamEqs fam
+  return (smtStr,assertions, foldMap snd argDeps ++ resDeps)
+
+convertFamEqs :: TyCon  -> ConvMonad [SExpr]
+convertFamEqs tc
+  | Just bs <- isClosedSynFamilyTyConWithAxiom_maybe tc =
+      map SMT.Atom <$> compileBranches (show $ getUnique tc) (fromBranches $ co_ax_branches bs)
+  | otherwise = return []
+
+compileBranches :: String -> [CoAxBranch] -> ConvMonad [String]
+compileBranches funName bs = return []
 
 -- | Converting Local Declarations
 convertDecs :: [Decl] -> ConvMonad [SExpr]
@@ -221,13 +230,6 @@ convertDecs ds = do
   let ourMap = M.fromList assocList
   let uniqueDecs = foldMap snd $ M.toList ourMap
   return $ map SMT.Atom uniqueDecs where
-
-
-mkDefaultSMTVar :: TyVar -> SExpr
-mkDefaultSMTVar tv = let
-  name = show $ getUnique tv
-  smtStr = "(declare-const " ++ name ++ " Type)"
-  in SMT.Atom smtStr
 
 mkSMTSort :: TyVar -> SExpr
 mkSMTSort tv = let
@@ -267,7 +269,6 @@ data ConvDependencies where
   ConvDeps ::
     { convTyVars :: [TyVar] -- Type variables for a known theory
     , convKdVars :: [TyVar] -- Kind variables for unknown theories
-    , convDefVar :: [TyVar] -- Type variables for default, syntactic theories
     , convDecs   :: [Decl]  -- SMT declarations specific to some converted type
     , convTyFams :: [TyCon]
     , convNewSorts :: [String]
@@ -285,11 +286,11 @@ data Decl where
 type Hash = String
 
 instance Semigroup ConvDependencies where
-  (ConvDeps a b c d i k) <> (ConvDeps e f g h j l) =
-    ConvDeps (a ++ e) (b ++ f) (c ++ g) (d ++ h) (i ++ j) (k ++ l)
+  (ConvDeps a b d i k) <> (ConvDeps e f h j l) =
+    ConvDeps (a ++ e) (b ++ f) (d ++ h) (i ++ j) (k ++ l)
 
 instance Monoid ConvDependencies where
-  mempty = ConvDeps [] [] [] [] [] []
+  mempty = ConvDeps [] [] [] [] []
   mappend = (<>)
 
 
@@ -349,8 +350,8 @@ tryConvTheory ty = do
       defaultConvTy ty
 
 addDepParts :: ConvDependencies -> [KdVar] -> [Decl] -> ConvDependencies
-addDepParts (ConvDeps t k d decl fams s) ks decls =
-  ConvDeps t (k ++ ks) d (decl ++ decls) fams s
+addDepParts (ConvDeps t k decl fams s) ks decls =
+  ConvDeps t (k ++ ks) (decl ++ decls) fams s
 
 convDecConts :: [DecCont] -> ConvMonad ([Decl], [KdVar])
 convDecConts dcs = do
