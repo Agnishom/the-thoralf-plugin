@@ -25,12 +25,14 @@ import GhcPlugins hiding ( (<>) )
 import TcRnTypes ( Ct, ctPred )
 import Class ( Class(..) )
 import TcType ( Kind )
-import Var ( TyVar )
+import Var ( TyVar, Var )
 import Type ( Type, PredTree (..), EqRel (..), getTyVar_maybe
             , splitTyConApp_maybe, splitFunTy_maybe
             , classifyPredType, tyVarKind )
 import CoAxiom
 import DataCon
+import FV
+import Unify
 
 -- Internal imports
 import ThoralfPlugin.Encode.TheoryEncoding
@@ -257,7 +259,60 @@ convertFamEqs tc
   | otherwise = return []
 
 compileBranches :: String -> [CoAxBranch] -> ConvMonad [String]
-compileBranches funName bs = return []
+compileBranches funName bs = mapM (compileBranch funName) bs
+
+compileBranch :: String -> CoAxBranch -> ConvMonad String
+compileBranch funName branch = do
+  --get the patterns of the branches which are incompatible to the current one
+  let incompatiblePatterns = map coAxBranchLHS $ coAxBranchIncomps branch
+  --get the list of variables that occur in the left hand side of the current branch
+  let varList = L.nub $ concatMap (fvVarList . tyCoFVsOfType) (coAxBranchLHS branch)
+  --form the SMT expression "... a b c ..." that will be used in the lhs to say "(= (funName ... a b c ...) ...)"
+  varExpr <- (unwords <$>) $ forM varList $ \var -> do
+    (tyName, _) <- convertType $ mkTyVarTy var
+    return tyName
+  --form the SMT expression "... (a Int) (b Type) ..." that will be used in the universal quantification
+  bindingExpr <- (unwords <$>) $ forM varList $ \var -> do
+    (tyName, _) <- convertType $ mkTyVarTy var
+    (sortName, _) <- convertKind (tyVarKind var)
+    return $ unwords ["(", tyName, sortName, ")"]
+  -- get the variables that are conflicting and also what they are conflicting with
+  let negList = concatMap (getConflicts varList (coAxBranchLHS branch)) incompatiblePatterns
+  -- now form the expression saying that "(not (= a 1) (= b 2))" which will talk about the previous patterns
+  negExprs <- forM negList $ \(v, t) -> do
+    (vName, _) <- convertType $ mkTyVarTy v
+    (tName, _) <- convertType t
+    return $ unwords ["(", "=", vName, tName, ")"]
+  let negExpr = "not" ++ " " ++ foldr1 (\x y -> unwords ["(", "or", x, y, ")"]) negExprs
+  -- form the SMT expression for the right hand side of the branch
+  rhsExpr <- (fst <$>) $ convertType $ coAxBranchRHS branch
+  let expr = if null varList
+        then unwords $ ["(", "assert"]
+                       ++ ["(", "=", "(", funName]
+                       ++ [varExpr]
+                       ++ [")", rhsExpr, ")", ")"]
+        else if null negList
+        then unwords $ ["(", "assert", "(", "forall", "("]
+                       ++ [bindingExpr] ++ [")"]
+                       ++ ["(", "=", "(", funName]
+                       ++ [varExpr]
+                       ++ [")", rhsExpr, ")", ")", ")"]
+        else unwords $ ["(", "assert", "(", "forall", "("]
+                       ++ [bindingExpr] ++ [")", "(", "=>" ]
+                       ++ ["(",negExpr, ")"]
+                       ++ ["(", "=", "(", funName]
+                       ++ [varExpr]
+                       ++ [")", rhsExpr, ")", ")", ")", ")"]
+  return expr
+
+getConflicts :: [Var] -> [Type] -> [Type] -> [(Var, Type)]
+getConflicts varList mainLHS incompatiblePattern =
+  case tcUnifyTysFG (const BindMe) mainLHS incompatiblePattern of
+    SurelyApart -> []
+    MaybeApart _ -> []
+    Unifiable subst@(TCvSubst vars tvEnv cvEnv) ->
+      concatMap (\v -> case lookupVarEnv tvEnv v of Nothing -> []
+                                                    Just ty -> [(v, ty)]) varList
 
 -- | Converting Local Declarations
 convertDecs :: [Decl] -> ConvMonad [SExpr]
