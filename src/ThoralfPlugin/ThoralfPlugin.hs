@@ -181,7 +181,7 @@ thoralfSolver debug (ThoralfState smtRef encode deCls) gs' ws' ds' = do
             SMT.Unknown -> tcPluginIO pop >> noSolving
             SMT.Sat -> do
               tcPluginIO $ do
-                _ <- SMT.simpleCommandMaybe smt ["get-model"]
+                -- _ <- SMT.simpleCommandMaybe smt ["get-model"]
                 pop
               noSolving
     _ -> printCts debug True gs ws ds
