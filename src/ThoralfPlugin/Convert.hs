@@ -8,6 +8,7 @@ module ThoralfPlugin.Convert where
 
 import Debug.Trace
 
+import Data.Char
 import Data.Maybe ( mapMaybe, catMaybes )
 import qualified Data.Map as M
 import qualified Data.List as L
@@ -133,9 +134,8 @@ conv cts = do
 
 showOut x = renderWithStyle unsafeGlobalDynFlags (ppr x) (defaultUserStyle unsafeGlobalDynFlags)
 
-makeSMTName :: Uniquable a => a -> String
-makeSMTName a = "var"++show (getUnique a)
-
+makeSMTName :: (Uniquable a, Outputable a) => a -> String
+makeSMTName a = filter isAlphaNum (showOut a)++"-"++show (getUnique a)
 
 -- ** Extraction
 --------------------------------------------------------------------------------
@@ -276,17 +276,17 @@ compileBranch funName branch = do
     return tyName
   --form the SMT expression "... (a Int) (b Type) ..." that will be used in the universal quantification
   bindingExpr <- (unwords <$>) $ forM varList $ \var -> do
-    (tyName, _) <- convertType $ mkTyVarTy var
+    let tyName = makeSMTName var
     (sortName, _) <- convertKind (tyVarKind var)
     return $ unwords ["(", tyName, sortName, ")"]
   -- get the variables that are conflicting and also what they are conflicting with
   let negList = concatMap (getConflicts varList (coAxBranchLHS branch)) incompatiblePatterns
   -- now form the expression saying that "(not (= a 1) (= b 2))" which will talk about the previous patterns
   negExprs <- forM negList $ \(v, t) -> do
-    (vName, _) <- convertType $ mkTyVarTy v
+    let vName = makeSMTName v
     (tName, _) <- convertType t
-    return $ unwords ["(", "=", vName, tName, ")"]
-  let negExpr = "not" ++ " " ++ foldr1 (\x y -> unwords ["(", "or", x, y, ")"]) negExprs
+    return $ unwords ["(not","(", "=", vName, tName, "))"]
+  let negExpr = foldr1 (\x y -> unwords ["(", "or", x, y, ")"]) negExprs
   -- form the SMT expression for the right hand side of the branch
   (rhsExpr,deps) <- convertType $ coAxBranchRHS branch
   let expr = if null varList
@@ -302,7 +302,7 @@ compileBranch funName branch = do
                        ++ [")", rhsExpr, ")", ")", ")"]
         else unwords $ ["(", "assert", "(", "forall", "("]
                        ++ [bindingExpr] ++ [")", "(", "=>" ]
-                       ++ ["(",negExpr, ")"]
+                       ++ [negExpr]
                        ++ ["(", "=", "(", funName]
                        ++ [lhsExpr]
                        ++ [")", rhsExpr, ")", ")", ")", ")"]
@@ -349,7 +349,8 @@ resolveLateDeps :: LateDeps -> ConvMonad [SExpr]
 resolveLateDeps deps = do
   (famStmts,adts,sorts) <- resolveFams (lateTyFams deps)
   adtStmts <- resolveADTs (adts <> lateADTs deps)
-  return $ defineType (sorts <> lateNewSorts deps) : (adtStmts ++ famStmts)
+  -- let fakeType = --SMT.Atom "(declare-sort Type)"
+  return $ adtStmts ++ defineType (sorts <> lateNewSorts deps) : famStmts
 
 resolveFams :: UniqSet TyCon -> ConvMonad ([SExpr],UniqSet TyCon,[String])
 resolveFams fams = do
