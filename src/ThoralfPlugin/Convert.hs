@@ -268,8 +268,8 @@ compileBranch funName branch = do
   --get the list of variables that occur in the left hand side of the current branch
   let varList = L.nub $ concatMap (fvVarList . tyCoFVsOfType) (coAxBranchLHS branch)
   --form the SMT expression "... a b c ..." that will be used in the lhs to say "(= (funName ... a b c ...) ...)"
-  varExpr <- (unwords <$>) $ forM varList $ \var -> do
-    (tyName, _) <- convertType $ mkTyVarTy var
+  lhsExpr <- (unwords <$>) $ forM (coAxBranchLHS branch) $ \ty -> do
+    (tyName, _) <- convertType ty
     return tyName
   --form the SMT expression "... (a Int) (b Type) ..." that will be used in the universal quantification
   bindingExpr <- (unwords <$>) $ forM varList $ \var -> do
@@ -289,24 +289,25 @@ compileBranch funName branch = do
   let expr = if null varList
         then unwords $ ["(", "assert"]
                        ++ ["(", "=", "(", funName]
-                       ++ [varExpr]
+                       ++ [lhsExpr]
                        ++ [")", rhsExpr, ")", ")"]
         else if null negList
         then unwords $ ["(", "assert", "(", "forall", "("]
                        ++ [bindingExpr] ++ [")"]
                        ++ ["(", "=", "(", funName]
-                       ++ [varExpr]
+                       ++ [lhsExpr]
                        ++ [")", rhsExpr, ")", ")", ")"]
         else unwords $ ["(", "assert", "(", "forall", "("]
                        ++ [bindingExpr] ++ [")", "(", "=>" ]
                        ++ ["(",negExpr, ")"]
                        ++ ["(", "=", "(", funName]
-                       ++ [varExpr]
+                       ++ [lhsExpr]
                        ++ [")", rhsExpr, ")", ")", ")", ")"]
   return expr
 
 getConflicts :: [Var] -> [Type] -> [Type] -> [(Var, Type)]
 getConflicts varList mainLHS incompatiblePattern =
+  filter (not . isTyVarTy . snd) $
   case tcUnifyTysFG (const BindMe) mainLHS incompatiblePattern of
     SurelyApart -> []
     MaybeApart _ -> []
