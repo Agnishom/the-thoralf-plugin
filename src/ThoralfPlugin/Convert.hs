@@ -10,6 +10,7 @@ import Debug.Trace
 
 import Data.Maybe ( mapMaybe, catMaybes )
 import qualified Data.Map as M
+import qualified Data.List as L
 import qualified Data.Set as S
 import qualified SimpleSMT as SMT
 import Data.Semigroup
@@ -132,6 +133,9 @@ conv cts = do
 
 showOut x = renderWithStyle unsafeGlobalDynFlags (ppr x) (defaultUserStyle unsafeGlobalDynFlags)
 
+makeSMTName :: Uniquable a => a -> String
+makeSMTName a = "var"++show (getUnique a)
+
 
 -- ** Extraction
 --------------------------------------------------------------------------------
@@ -209,7 +213,7 @@ convertFieldType otycon oargs ty = do
   case splitTyConApp_maybe ty of
     Just (tcon,args)
       | (tcon == otycon && and (zipWith eqType args $ map mkTyVarTy oargs)) ->
-        return (show $ getUnique tcon, mempty)
+        return (makeSMTName tcon, mempty)
     _ -> convertKind ty
 
 convertPromoted :: TyCon -> ConvMonad (SExpr, UniqSet TyCon)
@@ -218,8 +222,8 @@ convertPromoted tc =
   then do
     let dcs = visibleDataCons $ algTyConRhs tc
         argVars = tyConTyVars tc
-        args = map (\tv -> show (getUnique tv)) argVars
-        name = show $ getUnique tc
+        args = map makeSMTName argVars
+        name = makeSMTName tc
         convertCon dc = do
           convertedFieldTypes <- traverse (convertFieldType tc argVars) (dataConOrigArgTys dc)
           let
@@ -229,7 +233,7 @@ convertPromoted tc =
             fields = zipWith (\n t -> "("++n++" "++t++")") fieldNames fieldTypes
           return ("("++unwords (dname:fields)++")", deps)
           where
-            dname = show $ getUnique dc
+            dname = makeSMTName dc
     convertedCons <- traverse convertCon dcs
     let
       cons = map fst convertedCons
@@ -240,7 +244,7 @@ convertPromoted tc =
 
 convertFam :: TyCon -> ConvMonad (SExpr,UniqSet TyCon)
 convertFam fam = do
-  let name = show $ getUnique fam
+  let name = makeSMTName fam
   let kind = tyConKind fam
   let (argtys,resty) = splitFunTys kind
   argDeps <- mapM convertKind argtys
@@ -253,14 +257,14 @@ convertFam fam = do
 convertFamEqs :: TyCon  -> ConvMonad ([SExpr],LateDeps)
 convertFamEqs tc
   | Just bs <- isClosedSynFamilyTyConWithAxiom_maybe tc = do
-      stmts <- map SMT.Atom <$> compileBranches (show $ getUnique tc) (fromBranches $ co_ax_branches bs)
-      return (stmts,mempty)
+      stmts <- compileBranches (makeSMTName tc) (fromBranches $ co_ax_branches bs)
+      return (map fst stmts,foldMap snd stmts)
   | otherwise = return ([],mempty)
 
-compileBranches :: String -> [CoAxBranch] -> ConvMonad [String]
+compileBranches :: String -> [CoAxBranch] -> ConvMonad [(SExpr,LateDeps)]
 compileBranches funName bs = mapM (compileBranch funName) bs
 
-compileBranch :: String -> CoAxBranch -> ConvMonad String
+compileBranch :: String -> CoAxBranch -> ConvMonad (SExpr, LateDeps)
 compileBranch funName branch = do
   --get the patterns of the branches which are incompatible to the current one
   let incompatiblePatterns = map coAxBranchLHS $ coAxBranchIncomps branch
@@ -284,7 +288,7 @@ compileBranch funName branch = do
     return $ unwords ["(", "=", vName, tName, ")"]
   let negExpr = "not" ++ " " ++ foldr1 (\x y -> unwords ["(", "or", x, y, ")"]) negExprs
   -- form the SMT expression for the right hand side of the branch
-  rhsExpr <- (fst <$>) $ convertType $ coAxBranchRHS branch
+  (rhsExpr,deps) <- convertType $ coAxBranchRHS branch
   let expr = if null varList
         then unwords $ ["(", "assert"]
                        ++ ["(", "=", "(", funName]
@@ -302,7 +306,7 @@ compileBranch funName branch = do
                        ++ ["(", "=", "(", funName]
                        ++ [lhsExpr]
                        ++ [")", rhsExpr, ")", ")", ")", ")"]
-  return expr
+  return (SMT.Atom expr,convLateDeps deps)
 
 getConflicts :: [Var] -> [Type] -> [Type] -> [(Var, Type)]
 getConflicts varList mainLHS incompatiblePattern =
@@ -324,7 +328,7 @@ convertDecs ds = do
 
 mkSMTSort :: TyVar -> SExpr
 mkSMTSort tv = let
-  name = (show $ getUnique tv)
+  name = (makeSMTName tv)
   smtStr = "(declare-sort " ++ name ++ ")"
   in SMT.Atom smtStr
 
@@ -334,7 +338,7 @@ type KdVar = TyVar
 convertTyVars :: TyVar -> ConvMonad (SExpr, ([KdVar],UniqSet TyCon))
 convertTyVars tv = do
   (smtSort, kindVars) <- convertKind $ tyVarKind tv
-  let tvId = show $ getUnique tv
+  let tvId = makeSMTName tv
   let smtVar = "(declare-const " ++ tvId ++ " " ++ smtSort ++ ")"
   return (SMT.Atom smtVar, kindVars)
 
@@ -470,7 +474,7 @@ tyVarConv ty = do
   -- See doc on "dumb tau variables"
   let isSkolem = True
   guard isSkolem
-  let tvarStr = show $ getUnique tyvar
+  let tvarStr = makeSMTName tyvar
   return (tvarStr, tyvar)
 
 
@@ -527,7 +531,7 @@ defaultConvTy = tryFnsM [defFn, adtDef, defTyConApp, defTyApp] where
     recur <- traverse convertType tys
     let defConvTys = map fst recur
     let tvars = foldMap snd recur
-    let convTcon = show (getUnique dc)
+    let convTcon = makeSMTName dc
     let converted = case defConvTys of
           [] -> convTcon
           _ ->  "("++unwords (convTcon:defConvTys)++")"
@@ -562,7 +566,7 @@ defaultConvTy = tryFnsM [defFn, adtDef, defTyConApp, defTyApp] where
       recur <- traverse convertType tys
       let defConvTys = map fst recur
       let tvars = foldMap snd recur
-      let convTcon = show (getUnique tcon)
+      let convTcon = makeSMTName tcon
       let converted = "("++unwords (convTcon:defConvTys)++")"
       return (converted, tvars <> mempty{convLateDeps = mempty{lateTyFams = unitUniqSet tcon}})
     else do
@@ -570,7 +574,7 @@ defaultConvTy = tryFnsM [defFn, adtDef, defTyConApp, defTyApp] where
       recur <- traverse convertTypeToSortType tys
       let defConvTys = map fst recur
       let tvars = foldMap snd recur
-      let convTcon = "(constructor \"" ++ (show $ getUnique tcon) ++ "\")"
+      let convTcon = "(constructor \"" ++ (makeSMTName tcon) ++ "\")"
       let converted = foldl appDef convTcon defConvTys
       return (converted, tvars)
 
@@ -589,7 +593,7 @@ convertKind :: Kind -> ConvMonad (String, ([KdVar],UniqSet TyCon))
 convertKind kind =
   case getTyVar_maybe kind of
     Just tvar ->
-      return ((show $ getUnique tvar), ([tvar],mempty))
+      return ((makeSMTName tvar), ([tvar],mempty))
     Nothing -> convKindTheories kind
 
 convKindTheories :: Kind -> ConvMonad (String, ([KdVar],UniqSet TyCon))
@@ -605,7 +609,7 @@ convKindTheories kind = do
     Nothing
       | Just (tcon,xs) <- splitTyConApp_maybe kind
       , isAlgTyCon tcon -> do
-          let name = show $ getUnique tcon
+          let name = makeSMTName tcon
           args' <- traverse convertKind xs
           let args = map fst args'
               deps = (foldMap snd args') <> (mempty,unitUniqSet tcon)
