@@ -9,13 +9,13 @@ module ThoralfPlugin.Convert where
 import Debug.Trace
 
 import Data.Maybe ( mapMaybe, catMaybes )
-import qualified Data.List as L
 import qualified Data.Map as M
 import qualified Data.Set as S
 import qualified SimpleSMT as SMT
 import Data.Semigroup
 import Control.Monad.Reader
 import Prelude
+import UniqSet
 
 import DynFlags
 import Outputable hiding ( (<>) )
@@ -62,7 +62,7 @@ data ConvCts where
   ConvCts ::
     { convEquals :: [(SExpr, Ct)]
     , convDeps :: [SExpr]
-    , convSorts :: [String]
+    , convLDeps :: LateDeps
     } -> ConvCts
 
 
@@ -97,14 +97,14 @@ conv cts = do
   convEqs <- mapSome $ fmap convPair (map fst equals)
 
   let deps = mconcat $ map snd convDisEqs ++ map snd convEqs
-  decls <- convertDeps deps
+  (decls,ldeps) <- convertDeps deps
 
   let eqExprs = map (mkEqExpr . fst) convEqs
   let disEqExprs = map (mkDisEqExpr . fst) convDisEqs
   let matchingCts = map snd $ disEquals ++ equals
   --guard (length matchingCts == length (disEqExprs ++ eqExprs))
   let convPairs = zip (disEqExprs ++ eqExprs) matchingCts
-  return $ ConvCts convPairs decls (convNewSorts deps)
+  return $ ConvCts convPairs decls ldeps
 
   where
 
@@ -171,35 +171,28 @@ maybeExtractTyEq ct = do
 nub :: Ord a => [a] -> [a]
 nub = S.toList . S.fromList
 
-convertDeps :: ConvDependencies -> ConvMonad [SExpr]
-convertDeps (ConvDeps tyvars' kdvars' decs fams' _ adts') = do
+convertDeps :: ConvDependencies -> ConvMonad ([SExpr], LateDeps)
+convertDeps (ConvDeps tyvars' kdvars' decs deps) = do
   let tyvars = nub tyvars'
   let kdvars = nub kdvars'
-  let fams = L.nub fams'
-  let adts = L.nub adts'
   (EncodingData _ theories) <- ask
   let mkPred = tyVarPreds theories
   let tvPreds = foldMap (fmap SMT.Atom) $ mapMaybe mkPred tyvars
 
   convertedTyVars <- traverse convertTyVars tyvars
-  convertedFams <- traverse convertFam fams
-  convertedADTs <- traverse convertPromoted adts
 
   let tyVarExprs  = map       fst convertedTyVars
-  let tyVarKdVars = concatMap snd convertedTyVars
+  let tyVarKdVars = concatMap (fst . snd) convertedTyVars
+  let tyVarDeps   = mempty{lateADTs = foldMap (snd . snd) convertedTyVars}
 
-  let famDecs       = map       (\(a,_,_)->a) convertedFams
-  let famAssertions = concatMap (\(_,b,_)->b) convertedFams
-  let famKdVars     = concatMap (\(_,_,c)->c) convertedFams
-
-  let kindVars = nub $ tyVarKdVars  ++ kdvars ++ famKdVars
+  let kindVars = nub $ tyVarKdVars  ++ kdvars
   let kindExprs = map mkSMTSort kindVars
   decExprs <- convertDecs decs
   -- Order matters:
-  let varExprs = kindExprs ++ convertedADTs ++ tyVarExprs ++ famDecs ++ famAssertions
+  let varExprs = kindExprs ++ tyVarExprs
   let otherExprs = decExprs ++ tvPreds
   let exprs = varExprs ++ otherExprs
-  return exprs
+  return (exprs,deps<>tyVarDeps)
 
 defineType :: [String] -> SExpr
 defineType sorts' = SMT.Atom $
@@ -209,15 +202,15 @@ defineType sorts' = SMT.Atom $
   xs = map f sorts
   f s = unwords ["(inc"++s,"(get"++s,s++"))"]
 
-convertFieldType :: TyCon -> [TyVar] -> Kind -> ConvMonad String
+convertFieldType :: TyCon -> [TyVar] -> Kind -> ConvMonad (String,([KdVar],UniqSet TyCon))
 convertFieldType otycon oargs ty = do
   case splitTyConApp_maybe ty of
     Just (tcon,args)
       | (tcon == otycon && and (zipWith eqType args $ map mkTyVarTy oargs)) ->
-        return $ show $ getUnique tcon
-    _ -> fst <$> convertKind ty
+        return (show $ getUnique tcon, mempty)
+    _ -> convertKind ty
 
-convertPromoted :: TyCon -> ConvMonad SExpr
+convertPromoted :: TyCon -> ConvMonad (SExpr, UniqSet TyCon)
 convertPromoted tc =
   if isAlgTyCon tc
   then do
@@ -227,18 +220,23 @@ convertPromoted tc =
         name = show $ getUnique tc
         convertCon dc = do
           convertedFieldTypes <- traverse (convertFieldType tc argVars) (dataConOrigArgTys dc)
-          let fieldNames = map (\n -> dname++"Field"++show n ) [1..]
-              fields = zipWith (\n t -> "("++n++" "++t++")") fieldNames convertedFieldTypes
-          return $ "("++unwords (dname:fields)++")"
+          let
+            fieldTypes = map fst convertedFieldTypes
+            deps = foldMap snd convertedFieldTypes
+            fieldNames = map (\n -> dname++"Field"++show n ) [1..]
+            fields = zipWith (\n t -> "("++n++" "++t++")") fieldNames fieldTypes
+          return ("("++unwords (dname:fields)++")", deps)
           where
             dname = show $ getUnique dc
     convertedCons <- traverse convertCon dcs
-    let defn = "(("++unwords (name:convertedCons)++"))"
-        smtStr = unwords ["(declare-datatypes ("++unwords args++")", defn,")"]
-    return $ SMT.Atom smtStr
+    let
+      cons = map fst convertedCons
+      defn = "(("++unwords (name:cons)++"))"
+      smtStr = unwords ["(declare-datatypes ("++unwords args++")", defn,")"]
+    return (SMT.Atom smtStr, foldMap (snd . snd) convertedCons)
   else lift $ Nothing
 
-convertFam :: TyCon -> ConvMonad (SExpr,[SExpr],[KdVar])
+convertFam :: TyCon -> ConvMonad (SExpr,UniqSet TyCon)
 convertFam fam = do
   let name = show $ getUnique fam
   let kind = tyConKind fam
@@ -247,14 +245,15 @@ convertFam fam = do
   (res,resDeps) <- convertKind resty
   let args = unwords $ map fst argDeps
   let smtStr = SMT.Atom $ unwords ["(declare-fun",name,"(" ++ args ++ ")",res,")"]
-  assertions <- convertFamEqs fam
-  return (smtStr,assertions, foldMap snd argDeps ++ resDeps)
+  let deps = foldMap (snd . snd) argDeps <> snd resDeps
+  return (smtStr,deps)
 
-convertFamEqs :: TyCon  -> ConvMonad [SExpr]
+convertFamEqs :: TyCon  -> ConvMonad ([SExpr],LateDeps)
 convertFamEqs tc
-  | Just bs <- isClosedSynFamilyTyConWithAxiom_maybe tc =
-      map SMT.Atom <$> compileBranches (show $ getUnique tc) (fromBranches $ co_ax_branches bs)
-  | otherwise = return []
+  | Just bs <- isClosedSynFamilyTyConWithAxiom_maybe tc = do
+      stmts <- map SMT.Atom <$> compileBranches (show $ getUnique tc) (fromBranches $ co_ax_branches bs)
+      return (stmts,mempty)
+  | otherwise = return ([],mempty)
 
 compileBranches :: String -> [CoAxBranch] -> ConvMonad [String]
 compileBranches funName bs = return []
@@ -276,14 +275,50 @@ mkSMTSort tv = let
 
 -- | Kind variables are just type variables
 type KdVar = TyVar
-convertTyVars :: TyVar -> ConvMonad (SExpr, [KdVar])
+convertTyVars :: TyVar -> ConvMonad (SExpr, ([KdVar],UniqSet TyCon))
 convertTyVars tv = do
   (smtSort, kindVars) <- convertKind $ tyVarKind tv
   let tvId = show $ getUnique tv
   let smtVar = "(declare-const " ++ tvId ++ " " ++ smtSort ++ ")"
   return (SMT.Atom smtVar, kindVars)
 
+generatePrelude :: EncodingData -> LateDeps -> Maybe [SExpr]
+generatePrelude enc deps = runReaderT (resolveLateDeps deps) enc
 
+resolveLateDeps :: LateDeps -> ConvMonad [SExpr]
+resolveLateDeps deps = do
+  (famStmts,adts,sorts) <- resolveFams (lateTyFams deps)
+  adtStmts <- resolveADTs (adts <> lateADTs deps)
+  return $ defineType (sorts <> lateNewSorts deps) : (adtStmts ++ famStmts)
+
+resolveFams :: UniqSet TyCon -> ConvMonad ([SExpr],UniqSet TyCon,[String])
+resolveFams fams = do
+  (defs,eqs,adts,sorts) <- go emptyUniqSet (nonDetEltsUniqSet fams)
+  return (defs++eqs,adts,sorts)
+  where
+    go done [] = return ([],[],mempty,[])
+    go done (x:xs)
+      | elementOfUniqSet x done = return ([],[],mempty,[])
+      | otherwise = do
+        (dfn,adts) <- convertFam x
+        let done1 = addOneToUniqSet done x
+        (cureqs,deps) <- convertFamEqs x
+        let depFams = nonDetEltsUniqSet $ lateTyFams deps
+        (defs,eqs,adts1,sorts1) <- go done1 (depFams ++ xs)
+        return (dfn:defs,cureqs++eqs,adts<>lateADTs deps<>adts1,lateNewSorts deps ++ sorts1)
+
+resolveADTs :: UniqSet TyCon -> ConvMonad [SExpr]
+resolveADTs adts = fst <$> go emptyUniqSet (nonDetEltsUniqSet adts)
+  where
+    go done [] = return ([],done)
+    go done (x:xs)
+      | elementOfUniqSet x done = return ([],done)
+      | otherwise = do
+        (this,deps) <- convertPromoted x
+        let done1 = addOneToUniqSet done x
+        (before,done2) <- go done1 (nonDetEltsUniqSet deps)
+        (after,done3) <- go done2 xs
+        return (before ++ this:after,done3)
 
 
 -- * Converting A Single Type
@@ -298,6 +333,22 @@ convertTyVars tv = do
 -- term is mentioned.
 type ConvertedType = (String, ConvDependencies)
 
+-- | These are dependencies that are shared across given
+-- and wanted, and satisifying them may be recursive
+data LateDeps
+  = LateDeps
+  { lateTyFams :: UniqSet TyCon
+  , lateNewSorts :: [String]
+  , lateADTs :: UniqSet TyCon
+  }
+
+instance Semigroup LateDeps where
+  (LateDeps a1 b1 c1) <> (LateDeps a2 b2 c2) =
+    LateDeps (a1<>a2) (b1<>b2) (c1<>c2)
+instance Monoid LateDeps where
+  mempty = LateDeps mempty mempty mempty
+  mappend = (<>)
+
 -- | These are pieces of a type that need to be converted into
 -- SMT declarations or definitions in order for the converted
 -- type to be well sorted or correct.
@@ -306,9 +357,7 @@ data ConvDependencies where
     { convTyVars :: [TyVar] -- Type variables for a known theory
     , convKdVars :: [TyVar] -- Kind variables for unknown theories
     , convDecs   :: [Decl]  -- SMT declarations specific to some converted type
-    , convTyFams :: [TyCon]
-    , convNewSorts :: [String]
-    , convADTs   :: [TyCon]
+    , convLateDeps :: LateDeps
     } -> ConvDependencies
 
 noDeps :: ConvDependencies
@@ -323,11 +372,11 @@ data Decl where
 type Hash = String
 
 instance Semigroup ConvDependencies where
-  (ConvDeps a1 b1 c1 d1 e1 f1) <> (ConvDeps a2 b2 c2 d2 e2 f2) =
-    ConvDeps (a1<>a2) (b1<>b2) (c1<>c2) (d1<>d2) (e1<>e2) (f1<>f2)
+  (ConvDeps a1 b1 c1 d1) <> (ConvDeps a2 b2 c2 d2) =
+    ConvDeps (a1<>a2) (b1<>b2) (c1<>c2) (d1<>d2)
 
 instance Monoid ConvDependencies where
-  mempty = ConvDeps [] [] [] [] [] []
+  mempty = ConvDeps [] [] [] mempty
   mappend = (<>)
 
 
@@ -348,13 +397,15 @@ convertType ty = do
 convertTypeToSortType :: Type -> ConvMonad ConvertedType
 convertTypeToSortType ty = do
   (t, deps) <- convertType ty
-  (k, kdvars) <- convertKind $ typeKind ty
+  (k, kdeps) <- convertKind $ typeKind ty
   if k == "Type"
   then return (t,deps)
   else do
     let t' = "(inc"++k++" "++t++")"
+        kdvars = fst kdeps
+        ldeps = mempty{lateADTs=snd kdeps, lateNewSorts=[k]}
     return $ (t', deps{convKdVars = kdvars ++ convKdVars deps
-                      ,convNewSorts = k:convNewSorts deps})
+                      ,convLateDeps = convLateDeps deps <> ldeps})
 
 tyVarConv :: Type -> Maybe (String, TyVar)
 tyVarConv ty = do
@@ -375,29 +426,30 @@ tryConvTheory ty = do
     Just (TyConvCont tys kds cont decs) -> do
       recurTys <- vecMapAll convertType tys
       recurKds <- vecMapAll convertKind kds
-      (decls, decKds) <- convDecConts decs
+      (decls, (decKds,decAdts)) <- convDecConts decs
       let convTys = fmap fst recurTys
       let convKds = fmap fst recurKds
       let converted = cont convTys convKds
       let tyDeps = foldMap snd recurTys
-      let kdVars = foldMap snd recurKds ++ decKds
-      let deps = addDepParts tyDeps kdVars decls
+      let kdVars = foldMap (fst . snd) recurKds ++ decKds
+      let adts   = foldMap (snd . snd) recurKds
+      let deps = addDepParts tyDeps kdVars decls (adts<>decAdts)
       return (converted, deps)
     Nothing -> do
       defaultConvTy ty
 
-addDepParts :: ConvDependencies -> [KdVar] -> [Decl] -> ConvDependencies
-addDepParts (ConvDeps t k decl fams s adts) ks decls =
-  ConvDeps t (k ++ ks) (decl ++ decls) fams s adts
+addDepParts :: ConvDependencies -> [KdVar] -> [Decl] -> UniqSet TyCon -> ConvDependencies
+addDepParts (ConvDeps t k decl late) ks decls adts =
+  ConvDeps t (k ++ ks) (decl ++ decls) (late{lateADTs=lateADTs late <> adts})
 
-convDecConts :: [DecCont] -> ConvMonad ([Decl], [KdVar])
+convDecConts :: [DecCont] -> ConvMonad ([Decl], ([KdVar],UniqSet TyCon))
 convDecConts dcs = do
   decConts <- traverse convDecCont dcs
   let decls = map fst decConts
-  let kdVars = concatMap snd decConts
+  let kdVars = foldMap snd decConts
   return (decls, kdVars) where
 
-  convDecCont :: DecCont -> ConvMonad (Decl, [KdVar])
+  convDecCont :: DecCont -> ConvMonad (Decl, ([KdVar],UniqSet TyCon))
   convDecCont (DecCont kholes declName cont) = do
    recur <- vecMapAll convertKind kholes
    let kConvs = fmap fst recur
@@ -423,7 +475,7 @@ defaultConvTy = tryFnsM [defFn, adtDef, defTyConApp, defTyApp] where
     let converted = case defConvTys of
           [] -> convTcon
           _ ->  "("++unwords (convTcon:defConvTys)++")"
-    return (converted, tvars{convADTs = dataConTyCon dc : convADTs tvars})
+    return (converted, tvars <> mempty{convLateDeps = mempty{lateADTs = unitUniqSet $ dataConTyCon dc}})
 
   defFn :: Type -> ConvMonad ConvertedType
   defFn ty = do
@@ -456,7 +508,7 @@ defaultConvTy = tryFnsM [defFn, adtDef, defTyConApp, defTyApp] where
       let tvars = foldMap snd recur
       let convTcon = show (getUnique tcon)
       let converted = "("++unwords (convTcon:defConvTys)++")"
-      return (converted, tvars{convTyFams = tcon : convTyFams tvars})
+      return (converted, tvars <> mempty{convLateDeps = mempty{lateTyFams = unitUniqSet tcon}})
     else do
       -- Type constructors are represented as (constructor ...)
       recur <- traverse convertTypeToSortType tys
@@ -474,16 +526,17 @@ defaultConvTy = tryFnsM [defFn, adtDef, defTyConApp, defTyApp] where
 ------------------------------------------------------------------------------
 
 
--- | Converts a Kind into a String and some kind variables
---
-convertKind :: Kind -> ConvMonad (String, [KdVar])
+-- | Converts a Kind into a String and some kind variables, and
+-- ADT type constructors that must be defined for the kind to
+-- make sense
+convertKind :: Kind -> ConvMonad (String, ([KdVar],UniqSet TyCon))
 convertKind kind =
   case getTyVar_maybe kind of
     Just tvar ->
-      return ((show $ getUnique tvar), [tvar])
+      return ((show $ getUnique tvar), ([tvar],mempty))
     Nothing -> convKindTheories kind
 
-convKindTheories :: Kind -> ConvMonad (String, [KdVar])
+convKindTheories :: Kind -> ConvMonad (String, ([KdVar],UniqSet TyCon))
 convKindTheories kind = do
   EncodingData _ theories <- ask
   let kindConvFns = kindConvs theories
@@ -499,12 +552,11 @@ convKindTheories kind = do
           let name = show $ getUnique tcon
           args' <- traverse convertKind xs
           let args = map fst args'
+              deps = (foldMap snd args') <> (mempty,unitUniqSet tcon)
           case args of
-            [] -> return (name, concatMap snd args')
-            _ -> return (("("++unwords (name:args)++")"), concatMap snd args')
-
-      | otherwise -> return ("Type", []) -- Kind defaulting
-
+            [] -> return (name, deps)
+            _ -> return (("("++unwords (name:args)++")"), deps)
+      | otherwise -> return ("Type", mempty) -- Kind defaulting
 
 -- * A Common Helper Function
 

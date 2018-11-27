@@ -140,20 +140,25 @@ thoralfSolver debug (ThoralfState smtRef encode deCls) gs' ws' ds' = do
   let hideError = flip catchIOError (const $ return SMT.Sat)
   let pop = SMT.pop smt
   let noSolving = return $ TcPluginOk [] []
-  let convertor = convert (EncodingData deCls encode)
+  let theories  = EncodingData deCls encode
+  let convertor = convert theories
 
   case (convertor gs, convertor $ ws ++ ds) of
-    (Just (ConvCts gExprs decs1 sorts1), Just (ConvCts wExprs decs2 sorts2)) -> do
+    (Just (ConvCts gExprs decs1 deps1), Just (ConvCts wExprs decs2 deps2)) -> do
       debugIO debug $ "\nDecs:" ++ showList (decs1 ++ decs2)
       debugIO debug $ "\nGivens :" ++ showList gExprs
       debugIO debug $ "\nWanteds :" ++ showList wExprs
 
       let decs2' = decs2 \\ decs1
+      let sorts1 = lateNewSorts deps1
+      let sorts2 = lateNewSorts deps2
       let wSExpr = foldl SMT.or (SMT.Atom "false") (map (SMT.not . fst) wExprs)
       let wCtsWithEv = mapMaybe (addEvTerm . snd) wExprs
       givenCheck <- tcPluginIO $ hideError $ do
         SMT.push smt
-        _ <- SMT.ackCommand smt (defineType $ sorts1 ++ sorts2)
+        _ <- case generatePrelude theories (deps1 <> deps2) of
+          Nothing -> SMT.ackCommand smt (defineType $ sorts1 ++ sorts2)
+          Just prelude -> mapM_ (SMT.ackCommand smt) prelude
         _ <- traverse (SMT.ackCommand smt) decs1
         _ <- traverse (SMT.assert smt . fst) gExprs
         SMT.check smt
