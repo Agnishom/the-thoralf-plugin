@@ -87,7 +87,6 @@ mkThoralfInit debug seed = do
   let findModule = findImportedModule
   (Found _ disEqModule) <- findModule disEqName (Just pkgName)
   disEq <- findClass disEqModule "DisEquality"
-  let decs = startDecs encoding
   z3Solver <- tcPluginIO $ do
     let logLevel = if debug then 0 else 1
     logger <- SMT.newLogger logLevel
